@@ -2,258 +2,15 @@
 #include <stdio.h>
 #include <string.h>
 #include <cstdlib>
-#include <stdint.h>
+#include <map>
 #include <array>
-#define SLAVE
+#include <stdint.h>
+#include "initPeriph.h"
+#define MASTER
 
 class GameMaster;
 
-void SetAltFunc(GPIO_TypeDef* Port, int Channel, int AF)
-{
-  Port->MODER &= ~(3 << (2 * Channel)); // Сброс режима
-  Port->MODER |= 2 << (2 * Channel); // Установка альт. Режима
-  if (Channel < 8) // Выбор регистра зависит от номера контакта
-  {
-      Port->AFR[0] &= ~(15 << 4 * Channel); // Сброс альт. функции
-      Port->AFR[0] |= AF << (4 * Channel); // Установка альт. функции
-  }
-  else
-  {
-      Port->AFR[1] &= ~(15 << 4 * (Channel - 8)); // Сброс альт. функции
-      Port->AFR[1] |= AF << (4 * (Channel - 8)); // Установка альт. функции
-  }
-}
 
-void SetADC() {
-  RCC->APB2ENR |= RCC_APB2ENR_ADC1EN; // АЦП задействован
-  RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN; // Порт A задействован
-  GPIOC->MODER &= ~(GPIO_MODER_MODER3 | GPIO_MODER_MODER2); // Сброс режима для PC3 и PC2
-  GPIOC->MODER |= GPIO_MODER_MODER3_0 | GPIO_MODER_MODER3_1; // Аналоговый вход PC3
-  GPIOC->MODER |= GPIO_MODER_MODER2_0 | GPIO_MODER_MODER2_1; // Аналоговый вход PC2
-  ADC1->CR2 = ADC_CR2_ADON; // АЦП активен
-
-}
-
-enum PORT { A, B, C, D, E, F, G, H, I }; // Перечисление доступных портов
-void SetEXTI(PORT Port, int Channel, bool Rise, bool Fall)
-{
-  SYSCFG->EXTICR[Channel / 4] &= ~(15 << (4 * (Channel % 4))); // Сбросить порт
-  SYSCFG->EXTICR[Channel / 4] |= Port << (4 * (Channel % 4)); // Выбрать порт
-
-  EXTI->IMR |= 1 << Channel; // Прерывание выбрано
-
-  if (Rise) EXTI->RTSR |= 1 << Channel; // Ловить повышение напряжения
-  else EXTI->RTSR &= ~(1 << Channel); // Не ловить повышение напряжения
-
-  if (Fall) EXTI->FTSR |= 1 << Channel; // Ловить падение напряжения
-  else EXTI->FTSR &= ~(1 << Channel); // Не ловить падение напряжения
-}
-
-void ActivateUSARTs() {
-  RCC->APB2ENR |= RCC_APB2ENR_USART6EN; // UART 6 задействован (APB2=....?)
-
-  // Для платы LabBoard 1.1
-  RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN; // Порт A задействован
-  SetAltFunc(GPIOC, 6, 8); // Установка альт. режима PC6 для TX() (см. лаб. 2)
-  SetAltFunc(GPIOC, 7, 8); // Установка альт. режима PC7 для RX() (см. лаб. 2)
-  //--
-
-  USART6->BRR = (84000000) / 9600; // Делитель установлен на 11520 //???????????????
-
-  USART6->CR1 = USART_CR1_RE | USART_CR1_TE; // Приём и передача активны
-  USART6->CR1 |= USART_CR1_RXNEIE | USART_CR1_UE; // Прерывание на приём и запуск устройства
-
-  NVIC_SetPriority(USART6_IRQn, 0); // Высший приоритет прерывания
-  NVIC_EnableIRQ(USART6_IRQn); // Прерывание активно
-
-}
-
-//inline namespace. Global vars for RX buffer
-namespace {
-  const int DATA_Size = 128; // Размер принимающего буфера
-  char DATA_Buffer[DATA_Size]; // Принимающий буфер
-  int DATA_Head = 0; // Позиция для следующий записи
-  int DATA_Tail = 0; // Позиция для следующего чтения
-}
-
-extern "C" void USART6_IRQHandler() // Функция обработки прерывания
-{
-  int test = USART6->SR; // Читаем SR чтобы обработать прерывание
-  DATA_Buffer[DATA_Head++] = USART6->DR; // Читаем данные и задаём след. позицию
-  if (DATA_Head >= DATA_Size) DATA_Head = 0; // Начинаем с начала если превысили размер
-}
-
-int UART6_Recv(char* Data, int Size, bool WaitAll = false) // Функция приёма байт
-{
-  int size; // Размер принятых данных
-  for (size = 0; size < Size; size++) // Цикл приёма данных с учётом допустимого размера
-  {
-      if (WaitAll) while (DATA_Tail == DATA_Head) {} // Ждать прихода данных
-      else if (DATA_Tail == DATA_Head) break; // Данных больше нет, выходим из цикла
-      Data[size] = DATA_Buffer[DATA_Tail++]; // Читаем байт и задаём след. позицию
-      if (DATA_Tail >= DATA_Size) DATA_Tail = 0; // Превышение размера, идём сначала
-  }
-  return size; // Вернуть размер полученных данных
-}
-
-int UART6_GetString(char* Data, int Size) // Функция приёма строки
-{
-  int size;
-  int tmpTail = DATA_Tail;
-
-  // Размер принятых данных
-  int del = 0;
-  for (size = 0; size < (Size - 1); size++) // Цикл приёма данных с учётом допустимого размера
-  {
-      while (DATA_Tail == DATA_Head) {
-
-          del++;
-          if (del == 20000000) {
-              DATA_Tail = tmpTail;
-              return 0;
-          }
-      }// Ждать прихода данных
-      Data[size] = DATA_Buffer[DATA_Tail++]; // Читаем байт и задаём след. позицию
-      if (DATA_Tail >= DATA_Size) DATA_Tail = 0; // Превышение размера, идём сначала
-      if (Data[size] == '\n') { size++; break; } // Обнаружить новую строку
-  }
-  Data[size] = '\0'; // Установить конец строки
-  return size; // Вернуть размер полученных данных
-}
-
-void UART6_Send(char* Data, int Size) // Функция передачи байт
-{
-  while (Size--) // Цикл передачи данных
-  {                      // ???!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-      while (!(USART6->SR & USART_SR_TXE)) {} // Ждать возможности передавать
-      USART6->DR = *Data++; // Передать данные и задать след. позицию
-  }                    // ??????!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-  while (!(USART6->SR & USART_SR_TC)) {} // Ждать завершения передачи
-}
-
-
-void setI2C_2() {
-  RCC->APB1ENR |= RCC_APB1ENR_I2C2EN; // I2C 2 задействован
-  RCC->AHB1ENR |= RCC_AHB1ENR_GPIOHEN; // Порт H задействован
-  GPIOH->OTYPER |= GPIO_OTYPER_OT_4 | GPIO_OTYPER_OT_5; // Открытый сток для PH4 и PH5
-  GPIOH->OSPEEDR |= GPIO_OSPEEDER_OSPEEDR4_0 | GPIO_OSPEEDER_OSPEEDR4_1; // Мах. скорость PH4 
-  GPIOH->OSPEEDR |= GPIO_OSPEEDER_OSPEEDR5_0 | GPIO_OSPEEDER_OSPEEDR5_1; // Мах. скорость PH5
-  GPIOH->PUPDR |= GPIO_PUPDR_PUPDR4_0 | GPIO_PUPDR_PUPDR5_0; // Подтяжка 3.3V для PH4 и PH5
-  SetAltFunc(GPIOH, 4, 4); // Установка альт. режима AF4 для SCL(PH4) (см. лаб. 2)
-  SetAltFunc(GPIOH, 5, 4); // Установка альт. режима AF4 для SDA(PH5) (см. лаб. 2)
-  //****
-  I2C2->CR2 = (I2C_CR2_FREQ & 0x2A);
-  I2C2->CCR = I2C_CCR_FS | (I2C_CCR_CCR & 0x006C);
-  I2C2->TRISE = (I2C_TRISE_TRISE & 0x14);
-  //**
-  I2C2->CR1 = I2C_CR1_PE;
-  while (I2C3->SR2 & I2C_SR2_BUSY) {}
-
-}
-
-void setI2C_1() {
-  RCC->APB1ENR |= RCC_APB1ENR_I2C1EN; // I2C 1 задействован
-  RCC->AHB1ENR |= RCC_AHB1ENR_GPIOHEN; // Порт H задействован
-  GPIOH->OTYPER |= GPIO_OTYPER_OT_7 | GPIO_OTYPER_OT_8; // Открытый сток для PH7 и PH8
-  GPIOH->OSPEEDR |= GPIO_OSPEEDER_OSPEEDR7_0 | GPIO_OSPEEDER_OSPEEDR7_1; // Мах. скорость PH7 
-  GPIOH->OSPEEDR |= GPIO_OSPEEDER_OSPEEDR8_0 | GPIO_OSPEEDER_OSPEEDR8_1; // Мах. скорость PH8
-  GPIOH->PUPDR |= GPIO_PUPDR_PUPDR7_0 | GPIO_PUPDR_PUPDR8_0; // Подтяжка 3.3V для PH7 и PH8
-  SetAltFunc(GPIOH, 7, 4); // Установка альт. режима AF4 для SCL(PH7) (см. лаб. 2)
-  SetAltFunc(GPIOH, 8, 4); // Установка альт. режима AF4 для SDA(PH8) (см. лаб. 2)
-
-}
-
-
-void I2C1_Write(int Address, char Reg, char* Data, int Size) // регистр и данные
-{
-  I2C1->CR1 |= I2C_CR1_START; // Занимаем линию связи для данных
-  while (!(I2C1->SR1 & I2C_SR1_SB)) {} // Ждём занятия линии
-  I2C1->DR = (Address << 1) & ~I2C_OAR1_ADD0; // Шлём адрес для передачи данных
-  while (!(I2C1->SR1 & I2C_SR1_ADDR)) {} // Ждём успешной связи с устройством
-  I2C1->SR2; // Читаем SR2 для его отчистки
-  while (!(I2C1->SR1 & I2C_SR1_TXE)) {} // Ждем готовности передать байт
-  I2C1->DR = Reg; // Передаём байт регистра
-  while (Size--) // Цикл передачи байт
-  {
-      while (!(I2C1->SR1 & I2C_SR1_TXE)) {} // Ждем готовности передать байт
-      I2C1->DR = *Data++; // Передаём байт данных
-  }
-  while (!(I2C1->SR1 & I2C_SR1_BTF)) {} // Ждём окончания передачи данных
-  I2C1->CR1 |= I2C_CR1_STOP; // Освобождаем линию связи
-  while (I2C1->CR1 & I2C_CR1_STOP) {} // Ждём освобождения линии
-}
-
-
-void I2C_Write(int Address, char Reg, char* Data, int Size) // регистр и данные
-{
-  I2C2->CR1 |= I2C_CR1_START; // Занимаем линию связи для данных
-  while (!(I2C2->SR1 & I2C_SR1_SB)) {} // Ждём занятия линии
-  I2C2->DR = (Address << 1) & ~I2C_OAR1_ADD0; // Шлём адрес для передачи данных
-  while (!(I2C2->SR1 & I2C_SR1_ADDR)) {} // Ждём успешной связи с устройством
-  I2C2->SR2; // Читаем SR2 для его отчистки
-  while (!(I2C2->SR1 & I2C_SR1_TXE)) {} // Ждем готовности передать байт
-  I2C2->DR = Reg; // Передаём байт регистра
-  while (Size--) // Цикл передачи байт
-  {
-      while (!(I2C2->SR1 & I2C_SR1_TXE)) {} // Ждем готовности передать байт
-      I2C2->DR = *Data++; // Передаём байт данных
-  }
-  while (!(I2C2->SR1 & I2C_SR1_BTF)) {} // Ждём окончания передачи данных
-  I2C2->CR1 |= I2C_CR1_STOP; // Освобождаем линию связи
-  while (I2C2->CR1 & I2C_CR1_STOP) {} // Ждём освобождения линии
-}
-
-
-const int Addr = 0x3C; // Глобальная переменная с адресом устройства
-const int AddrAS5600 = 0x36; // Глобальная переменная с адресом устройства
-void as5600COMMAND(char Value) { I2C_Write(AddrAS5600, 0x00, &Value, 1); }
-void Command(char Value) { I2C_Write(Addr, 0x00, &Value, 1); } // Запись в 0x00 регистр
-
-void turnOnSSD1309() {
-
-  RCC->AHB1ENR |= RCC_AHB1ENR_GPIOEEN; // Порт E задействован
-  GPIOE->MODER &= ~GPIO_MODER_MODER7; // Сброс режима для PE7
-  GPIOE->MODER |= GPIO_MODER_MODER7_0; // Установка режима на выход PE7
-  GPIOE->BSRRL = 1 << 7; // Установить значение HIGH (3.3V) для PE7
-
-  for (int a = 0; a < 1000000; a++) {};
-  Command(0xAE); // Display off
-  Command(0x20); // Set Memory Addressing Mode 
-  Command(0x10); // Page Addressing Mode (RESET)
-  Command(0xB0); // Set Page Start Address for Page Addressing Mode,0-7
-  Command(0xC8); // Set COM Output Scan Direction
-  Command(0x00); //---set low column address
-  Command(0x10); //---set high column address
-  Command(0x40); //--set start line address
-  Command(0x81); //--set contrast control register
-  Command(0xFF); // Orientation
-  Command(0xA1); //--set segment re-map (0 to 127)
-  Command(0xA6); //--set normal display
-  Command(0xA8); //--set multiplex ratio (1 to 64)
-  Command(0x3F); //
-  Command(0xA4); // Output follows RAM content
-  Command(0xD3); //-set display offset
-  Command(0x00); //-not offset
-  Command(0xD5); //--set display clock divide ratio/oscillator frequency
-  Command(0xF0); //--set divide ratio
-  Command(0xD9); //--set pre-charge period
-  Command(0x22); //
-  Command(0xDA); //--set com pins hardware configuration
-  Command(0x12); //
-  Command(0xDB); //--set vcomh
-  Command(0x20); // 0.77 * Vcc
-  Command(0x8D); //--set DC-DC enable
-  Command(0x14); //
-  Command(0xAF); //--turn on SSD1309 panel
-}
-
-
-
-
-
-const int Width = 128; // Глобальная переменная с шириной экрана
-const int Height = 64; // Глобальная переменная с высотой экрана
-char Buffer[Width * Height / 8]; // Буфер данных экрана
 void Clear() // Функция очистки буфера экрана
 {
   for (int a = 0; a < sizeof(Buffer); a++) Buffer[a] = 0;
@@ -328,15 +85,6 @@ void DrawOctoPixelGray(int x0, int y0) {
 
 }
 
-// read from ADC 
-int AnalogRead(int N) // Функция принимает номер канала для преобразования
-{
-  ADC1->SQR3 = N; // Выбран полученный из аргумента канал
-  for (int a = 0; a < 100; a++) { asm("NOP"); } // Ожидать больше 100 тактов
-  ADC1->CR2 |= ADC_CR2_SWSTART; // Начать преобразование
-  while (!(ADC1->SR & ADC_SR_EOC)) { asm("NOP"); } // Ждать установки бита конца операции
-  return ADC1->DR; // Вернуть результат преобразования
-}
 
 void Connect() {
 
@@ -358,7 +106,6 @@ enum GameStates {
 class GameMaster {
 
 private:
-  std::array<char, 16> rx;
   char coord[2];
   char answer[2];
   char hitCoord[4];
@@ -608,32 +355,6 @@ void setField(char* field, uint8_t W, uint8_t H) {
 
 }
 
-bool MasterHandShake() {
-  char handshake[32] = "hello\r\n"; // Буфер временных данных
-  char test[32] = "OK\r\n";
-  char rc[32] = "hello\r\n";
-  char rx[32];
-
-  while (1) {
-      int n;
-      
-       printf("->try to connect\n");
-      UART6_Send(handshake, strlen(handshake));
-
-      for (int i = 0; i < 20000000; i++);
-      int size = UART6_GetString(rx, sizeof(rx));
-      if (size > 1) {
-          printf("<-%s", rx);
-
-          if (strcmp(rx, "OK\r\n") == 0) {
-              
-              printf("->%s", test);
-              return true;
-          }
-      }
-  }
-}
-
 
 
 
@@ -724,60 +445,125 @@ bool Recieve() {
 }
 
 
-enum States {
-  TryToConnect,
-  Connected,
-  MakeMove,
-  SendMove,
-  GetAnswer,
-  GetAttack
+void periphInit();
+class ConnectMaster{
+public:
+  bool checkCorrect(char *arr, int size){
+    int t = arr[0] - '0';
+    int i =1;
+    while(i < size && arr[i] != '\0' ){
+      i++;
+    }
+    printf("size = %d\n", t);
+    if (i == t) return 1;
+  }
+  void MasterConnect(){
+    if(MasterHandShake()){
+      printf("->connected\n");
+      GM.currState = GameStates::SelectCoords;
+
+    }
+  }
+  void SlaveConnect(){
+    if(SlaveHandShake()){
+      printf("->connected\n");
+      GM.currState = GameStates::GetEnemyChoose;
+
+    }
+  }
+private:
+  std::array<char,16> handshake {"6hello\n"}; // Буфер временных данных
+  std::array<char,16> test{"3OK\n"};
+  std::array<char,16> rx;
+  std::array<char,16> gethandshake;
+  bool MasterHandShake() {
+    
+
+    while (1) {
+        int n;
+        
+        printf("->try to connect- %s\n",handshake.data() );
+       // checkCorrect(handshake.data(), handshake.size());
+        UART6_Send(handshake.data(), handshake.size());
+
+        for (int i = 0; i < 20000000; i++);
+        int size = UART6_GetString(rx.data(), (rx).size());
+        if (checkCorrect(rx.data(), (rx).size())) {
+            printf("<-%s", rx.data());
+            
+            if (strcmp(rx.data(), "2OK\n") == 0) {
+                
+                printf("->%s", test.data());
+                return true;
+            }
+            
+        }
+    }
+  }
+
+  bool SlaveHandShake() {
+  
+  
+    while (1) {
+        int n;
+        
+         printf("->wait connection\n");
+      //  UART6_Send(test, strlen(handshake));
+
+        for (int i = 0; i < 20000000; i++);
+        int size = UART6_GetString(gethandshake.data(), gethandshake.size());
+        if (size > 1) {
+            printf("<-%s", rx.data());
+
+            if (strcmp(rx.data(), "hello\r\n") == 0) {
+                
+                printf("->%s", test.data());
+                UART6_Send(test.data(), test.size());
+                return true;
+            }
+        }
+    }
+  }
+
 };
-
-bool SlaveHandShake() {
-  char handshake[32] = "hello\r\n"; // Буфер временных данных
-  char test[32] = "OK\r\n";
-  char rc[32] = "hello\r\n";
-  char rx[32] = "";
-
-  while (1) {
-      int n;
-      
-       printf("->wait connection\n");
-    //  UART6_Send(test, strlen(handshake));
-
-      for (int i = 0; i < 20000000; i++);
-      int size = UART6_GetString(rx, sizeof(rx));
-      if (size > 1) {
-          printf("<-%s\n", rx);
-
-          if (strcmp(rx, "hello\r\n") == 0) {
-              
-              printf("->%s", test);
-              UART6_Send(test, strlen(test));
-              return true;
-          }
-          else rx = "";
-      }
-  }
-}
-
-
-void MasterConnect(){
-  if(MasterHandShake()){
-    printf("->connected\n");
-    GM.currState = GameStates::SelectCoords;
-
-  }
-}
-void SlaveConnect(){
-  if(SlaveHandShake()){
-    printf("->connected\n");
-    GM.currState = GameStates::GetEnemyChoose;
-
-  }
-}
 int main()
 {
+  periphInit();
+
+  ConnectMaster CM;
+  GM.DrawField();
+  UpdateScreen();
+
+#ifdef MASTER
+  CM.MasterConnect();
+#else
+  CM.SlaveConnect();
+#endif  
+  //GM.currState = GameStates::SelectCoords;
+  while (1)
+  {
+
+     printf("curr state %d\n", GM.currState);
+
+      GM.DrawField();
+      GM.MakeMove();
+
+      /*
+      Connection, // первый коннект плат
+      SelectCoords, // выбор координат для атаки (ход)
+      TransieveCoord, // отпарвка выбранных координат
+      GetAnsver, // получить ответ - попал не попал
+      UpdateField, // отрисовать попал / непопал  
+      GetEnemyChoose, // получить ответ врага (его попытку атаки - координату)
+      SendAnsver
+      */
+
+    UpdateScreen();
+      
+  }
+}
+
+void periphInit(){
   ActivateUSARTs();
   
   RCC->AHB1ENR |= RCC_AHB1ENR_GPIOHEN | RCC_AHB1ENR_GPIOEEN;
@@ -798,58 +584,7 @@ int main()
 
   SetADC();
   setI2C_2();
-
-
+  
   turnOnSSD1309();
   Clear();
-
-  GM.DrawField();
-  UpdateScreen();
-
-
-
-  // UART6_Send(handshake, strlen(handshake)); // Получаем входящие данные
-  int del = 0;
- 
-  int x = 1, y = 1;
-#ifdef MASTER
-  MasterConnect();
-#else
-  SlaveConnect();
-#endif  
-  //GM.currState = GameStates::SelectCoords;
-  while (1)
-  {
-
-      printf("curr state %d\n", GM.currState);
-      GM.DrawField();
-      GM.MakeMove();
-
-     //GM.getHit();
-     // GM.DrawField();
-      
-      
-      
-    
-
-      /*
-      Connection, // первый коннект плат
-      SelectCoords, // выбор координат для атаки (ход)
-      TransieveCoord, // отпарвка выбранных координат
-      GetAnsver, // получить ответ - попал не попал
-      UpdateField, // отрисовать попал / непопал  
-      GetEnemyChoose, // получить ответ врага (его попытку атаки - координату)
-      SendAnsver
-      */
-
-      //   Recieve();
-      //    if(Attack(x++%8, y++%8)){
-      //      GM.UpdateEnemyField(x,y, '*');
-      //    }
-      //    else GM.UpdateEnemyField(x,y, '!');
-      //     
-
-    UpdateScreen();
-      
-  }
 }
